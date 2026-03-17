@@ -236,7 +236,7 @@ def get_kv_cache_shape(
 
 
 @jax.jit(donate_argnames="kv_cache")
-def update_kv_cache_jax(
+def update_kv_cache_pipelined(
     kv: jax.Array,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_lens: jax.Array,  # i32[max_num_seqs]
@@ -244,21 +244,34 @@ def update_kv_cache_jax(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
 ):
-  total_num_pages, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim = kv_cache.shape
+  (
+      total_num_pages,
+      page_size,
+      num_kv_heads_x2_per_kv_packing,
+      kv_packing,
+      head_dim,
+  ) = kv_cache.shape
   max_num_seqs = kv_lens.shape[0]
   num_page_indices = page_indices.shape[0]
   pages_per_seq = num_page_indices // max_num_seqs
-  
+
   max_num_tokens = kv.shape[0]
 
   num_seqs = distribution[-1]
   max_valid_q = cu_q_lens[num_seqs]
-  
+
   seq_indices = jnp.arange(max_num_seqs + 1)
-  safe_cu_q_lens = jnp.where(seq_indices <= num_seqs, cu_q_lens, max_num_tokens + 1)
+  safe_cu_q_lens = jnp.where(
+      seq_indices <= num_seqs, cu_q_lens, max_num_tokens + 1
+  )
 
   token_indices = jnp.arange(max_num_tokens)
-  seq_idx = jnp.searchsorted(safe_cu_q_lens, token_indices, side="right", method="sort") - 1
+  seq_idx = (
+      jnp.searchsorted(
+          safe_cu_q_lens, token_indices, side="right", method="sort"
+      )
+      - 1
+  )
   seq_idx_safe = jnp.clip(seq_idx, 0, max_num_seqs - 1)
 
   seq_q_start = safe_cu_q_lens[seq_idx_safe]
@@ -268,21 +281,101 @@ def update_kv_cache_jax(
 
   offset_in_update = token_indices - seq_q_start
   pos_in_seq = seq_kv_lens - seq_q_len + offset_in_update
-  
+
   page_idx_in_seq = pos_in_seq // page_size
   offset_in_page = pos_in_seq % page_size
 
   flat_page_indices_idx = seq_idx_safe * pages_per_seq + page_idx_in_seq
-  flat_page_indices_idx_safe = jnp.clip(flat_page_indices_idx, 0, num_page_indices - 1)
-  physical_page_idx = page_indices[flat_page_indices_idx_safe]
+  flat_page_indices_idx_safe = jnp.clip(
+      flat_page_indices_idx, 0, num_page_indices - 1
+  )
+  physical_page_idx = page_indices[flat_page_indices_idx_safe].astype(jnp.int32)
 
-  mask = token_indices < max_valid_q
+  # Leading to two gathers, using a mask with pl.when might be more efficient
+  # (and complex).
+  token_indices_safe = jnp.clip(
+      jnp.arange(max_num_tokens), 0, jnp.maximum(0, max_valid_q - 1)
+  )
+  physical_page_idx_safe = jnp.take(physical_page_idx, token_indices_safe)
+  offset_in_page_safe = jnp.take(offset_in_page, token_indices_safe)
 
-  physical_page_idx_int = physical_page_idx.astype(jnp.int32)
-  safe_physical_page_idx = jnp.where(mask, physical_page_idx_int, total_num_pages)
+  # Not a must but makes it much easier for tiling.
+  value_dim = num_kv_heads_x2_per_kv_packing * kv_packing * head_dim
+  num_chunks = value_dim // 128
 
-  kv_cache = kv_cache.at[safe_physical_page_idx, offset_in_page].set(kv, mode="drop")
-  return kv_cache
+  kv_flat = kv.reshape(max_num_tokens, value_dim)
+  kv_flat = jnp.take(kv_flat, token_indices_safe, axis=0)
+  kv_flat_chunked = kv_flat.reshape(-1, 128)
+
+  kv_cache_flat = kv_cache.reshape(
+      kv_cache.shape[0] * kv_cache.shape[1], value_dim
+  )
+  kv_cache_chunked = kv_cache_flat.reshape(-1, 128)
+
+  # 8-wide for 32-bits.
+  effective_sublanes = 8 * get_dtype_packing(kv.dtype)
+  # pltpu.async_copy only understands slicing offsets via a 1-dimensional array.
+  # Page level dereferencing, might not be necessary when compiler learns it.
+  flat_indices = (
+      physical_page_idx_safe * kv_cache.shape[1] + offset_in_page_safe
+  )
+  # Expands by a new dim, to update each chunk of kv.
+  flat_indices_chunked = (
+      flat_indices[:, None] * num_chunks + jnp.arange(num_chunks)[None, :]
+  )
+  flat_indices_chunked = flat_indices_chunked.reshape(-1)
+
+  assert (sc_info := pltpu.get_tpu_info().sparse_core)
+  total_subcores = sc_info.num_cores * sc_info.num_subcores
+
+  @functools.partial(
+      pl.pallas_call,
+      out_shape=jax.ShapeDtypeStruct(
+          kv_cache_chunked.shape, kv_cache_chunked.dtype
+      ),
+      grid=(total_subcores,),
+      in_specs=[
+          # IIUC since we call it aside from attention, kv might not be in VMEM.
+          pl.BlockSpec(memory_space=pltpu.HBM),
+          pl.BlockSpec(memory_space=pltpu.HBM),
+          pl.BlockSpec(memory_space=pltpu.HBM),
+      ],
+      out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+      input_output_aliases={0: 0},
+      compiler_params=pltpu.CompilerParams(
+          kernel_type=pltpu.CoreType.SC_VECTOR_SUBCORE,
+          use_tc_tiling_on_sc=True,
+          dimension_semantics=(pltpu.PARALLEL,),
+      ),
+  )
+  def _kernel(kv_cache_ref, kv_ref, idx_ref, o_hbm_ref):
+    core_id = pl.program_id(0)
+    total_grid_size = (max_num_tokens * num_chunks) // effective_sublanes
+    local_grid_size = total_grid_size // total_subcores
+
+    def body(kv_vmem, idx_vmem):
+      pltpu.sync_copy(kv_vmem, o_hbm_ref.at[idx_vmem])
+
+    # Nesting grid with pallas_call.
+    pltpu.emit_pipeline(
+        body,
+        grid=(local_grid_size,),
+        in_specs=[
+            pl.BlockSpec(
+                (effective_sublanes, 128),
+                lambda i: (core_id * local_grid_size + i, 0),
+            ),
+            pl.BlockSpec(
+                (effective_sublanes,),
+                lambda i: core_id * local_grid_size + i,
+            ),
+        ],
+        out_specs=[],
+        tiling=pltpu.Tiling.SPARSE_CORE,
+    )(kv_ref, idx_ref)
+
+  res: jax.Array = _kernel(kv_cache_chunked, kv_flat_chunked, flat_indices_chunked)  # pylint: disable=assignment-from-no-return
+  return res.reshape(kv_cache.shape)
 
 def _ragged_paged_attention_kernel(
     # Prefetch
@@ -1631,7 +1724,7 @@ def ragged_paged_attention(
         name=scope_name,
     )
 
-    updated_kv_cache = update_kv_cache_jax(kv, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
+    updated_kv_cache = update_kv_cache_pipelined(kv, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
     #output, updated_kv_cache = kernel(*scalar_prefetches, q, kv, kv_cache)
     output, _ = kernel(*scalar_prefetches, q, kv, kv_cache)
