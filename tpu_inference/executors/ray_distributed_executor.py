@@ -364,7 +364,11 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         # Environment variables to copy from driver to workers
         env_vars_to_copy = get_env_vars_to_copy(
             exclude_vars=self.WORKER_SPECIFIC_ENV_VARS,
-            additional_vars=set(current_platform.additional_env_vars),
+            additional_vars=set(current_platform.additional_env_vars) | {
+                "USE_JAX_PROFILER_SERVER", "JAX_PROFILER_SERVER_PORT",
+                "PYTHON_TRACER_LEVEL", "JAX_PROFILER_PYTHON_TRACER_LEVEL",
+                "JAX_ENABLE_X64", "TF_CPP_MIN_LOG_LEVEL"
+            },
             destination="workers")
 
         # Copy existing env vars to each worker's args

@@ -147,7 +147,7 @@ class TPUWorker(WorkerBase):
 
         use_jax_profiler_server = envs.USE_JAX_PROFILER_SERVER
         # Only one instance of profiler is allowed
-        if use_jax_profiler_server and self.rank < 1:
+        if use_jax_profiler_server and self.local_rank < 1:
             if not self.devices or 0 in self.device_ranks:
                 jax_profiler_server_port = envs.JAX_PROFILER_SERVER_PORT
                 logger.info(
