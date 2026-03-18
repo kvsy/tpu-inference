@@ -819,6 +819,7 @@ class SharedFusedMoe(JaxMoE):
     def __call__(self, x_TD: jax.Array) -> jax.Array:
         # Compute Routed Experts
         final_hidden_states = super().__call__(x_TD)
+        final_hidden_states *= self.routed_scaling_factor
 
         # (Maybe) Compute Shared Experts
         if self.shared_experts is not None:
@@ -1077,7 +1078,13 @@ class DeepSeekV3Router(JaxEinsum):
         x_TD = jax.lax.with_sharding_constraint(x_TD,
                                                 P(*self.activation_ffw_td))
 
+        # Expert assignments are accumulated in high precision to preserve accuracy.
+        # See: https://github.com/vllm-project/vllm/blob/e89a91d9275cd8ac086fe04476b41675a9ebbd5c/vllm/model_executor/layers/fused_moe/cpu_fused_moe.py#L59
         logits_TE = super().__call__(x_TD).astype(jnp.float32)
+
+        # TODO(gpolovets): add back support for DeepSeek routing.
+        if self.moe_backend in MoEBackend.fused_moe_backends():
+            return logits_TE
 
         # Apply scoring function (Sigmoid/Softmax) to get probabilities
         if self.scoring_func == "sigmoid":
@@ -1087,7 +1094,7 @@ class DeepSeekV3Router(JaxEinsum):
         else:
             probs_TE = logits_TE
 
-        # Will add Aux-Loss-Free bias the activation outputs during topk selection.
+        # Add Aux-Loss-Free bias to the activation outputs during topk selection.
         topk_indices_TX = self.get_topk_indices(probs_TE)
 
         # The actual weights do not include the bias terms.
@@ -1095,9 +1102,6 @@ class DeepSeekV3Router(JaxEinsum):
 
         if self.norm_topk_prob:
             weights_TX /= jnp.sum(weights_TX, axis=-1)[..., None] + 1e-20
-
-        # Scale expert weights before taking linear combination of experts.
-        weights_TX *= self.routed_scaling_factor
 
         return weights_TX.astype(self.dtype), topk_indices_TX
 
