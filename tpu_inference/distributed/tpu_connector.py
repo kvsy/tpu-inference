@@ -499,6 +499,8 @@ class TPUConnectorWorker:
         # Get the spec of the kv_caches
         kv_caches = runner.kv_caches
         kv_layer = kv_caches[0]
+        if isinstance(kv_layer, (tuple, list)):
+            kv_layer = kv_layer[0]
         self.num_layers = len(kv_caches)
         self.shape = list(kv_layer.shape)
         self.dtype = kv_layer.dtype
@@ -766,7 +768,7 @@ def get_uuid() -> int:
 @jax.jit
 def select_from_kv_caches(kv_caches: list[jax.Array],
                           indices: list[jax.Array]) -> list[jax.Array]:
-    selected = [cache.at[indices].get() for cache in kv_caches]
+    selected = [(cache[0] if isinstance(cache, (tuple, list)) else cache).at[indices].get() for cache in kv_caches]
     return selected
 
 
